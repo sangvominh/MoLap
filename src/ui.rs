@@ -189,7 +189,7 @@ impl State {
     }
 
     fn scale(&self, n: i32) -> i32 {
-        (n * self.dpi as i32 + 48) / 96
+        (n * self.dpi as i32 * 85 + 4_800) / 9_600
     }
     fn cell(&self, m: &Metric) -> i32 {
         self.scale(if m.kind == Kind::Ram { 71 } else { 51 })
@@ -211,7 +211,7 @@ impl State {
                 DeleteObject(self.symbol_font);
             }
             self.value_font = font("Segoe UI", self.scale(12));
-            self.symbol_font = font("Segoe Fluent Icons", self.scale(16));
+            self.symbol_font = font("Segoe Fluent Icons", self.scale(15));
             SetLayeredWindowAttributes(self.window, self.key(), 255, 1);
         }
     }
@@ -526,7 +526,7 @@ impl State {
         let original_pen = SelectObject(dc, pen);
         let original_brush = SelectObject(dc, GetStockObject(5)); // NULL_BRUSH
         SetBkMode(dc, 1);
-        let y = (area.height() - self.scale(16)) / 2;
+        let y = (area.height() - self.scale(15)) / 2;
         for m in &self.metrics {
             let size = self.cell(m);
             self.draw_icon(dc, m, area.left + self.scale(2), y, brush, ink);
@@ -941,6 +941,12 @@ unsafe fn popup(window: Handle) {
             },
         );
     }
+    let start_with_windows = crate::startup::enabled();
+    item(
+        if start_with_windows { 8 } else { 0 },
+        5,
+        "Start with Windows",
+    );
     item(0, 4, "Exit MoLap");
     let mut cursor = Point::default();
     GetCursorPos(&mut cursor);
@@ -975,6 +981,16 @@ unsafe fn popup(window: Handle) {
             }
         }
         3 => enable_pawnio(window),
+        5 => {
+            if let Err(error) = crate::startup::set_enabled(!start_with_windows) {
+                information(
+                    window,
+                    &format!("Could not update Windows startup: {error}"),
+                    HELP,
+                    0x30,
+                );
+            }
+        }
         4 => {
             close_strip(window);
         }
