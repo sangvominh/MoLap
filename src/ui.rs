@@ -3,7 +3,7 @@ use crate::{
     win::*,
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ffi::c_void,
     mem::{size_of, zeroed},
     os::windows::{ffi::OsStrExt, process::CommandExt},
@@ -33,7 +33,10 @@ static NOTIFY: &[u16] = &[
     84, 114, 97, 121, 78, 111, 116, 105, 102, 121, 87, 110, 100, 0,
 ]; // TrayNotifyWnd
 
-thread_local! { static UI: RefCell<Option<State>> = const { RefCell::new(None) }; }
+thread_local! {
+    static UI: RefCell<Option<State>> = const { RefCell::new(None) };
+    static RECREATE_STRIP: Cell<bool> = const { Cell::new(false) };
+}
 
 struct State {
     window: Handle,
@@ -42,6 +45,8 @@ struct State {
     worker: Option<std::thread::JoinHandle<()>>,
     metrics: Vec<Metric>,
     place: Option<Rect>,
+    taskbar_parent: Handle,
+    attempted_parent: Handle,
     missing_tray: Option<Instant>,
     dpi: u32,
     light: bool,
@@ -102,6 +107,8 @@ impl State {
             worker: Some(worker),
             metrics: Vec::new(),
             place: None,
+            taskbar_parent: 0,
+            attempted_parent: 0,
             missing_tray: None,
             dpi: 96,
             light: light_theme(),
@@ -222,7 +229,7 @@ impl State {
                 });
             self.metrics = next;
             if relayout {
-                self.position(true);
+                self.position();
             }
             if repaint {
                 unsafe {
@@ -256,7 +263,12 @@ impl State {
     fn hide_strip(&mut self, tray: bool) {
         self.place = None;
         self.show_tray(tray);
-        if unsafe { IsWindowVisible(self.window) } != 0 {
+        if self.hidden {
+            unsafe {
+                self.detach_taskbar();
+            }
+        }
+        if unsafe { GetWindowLongW(self.window, -16) } & 0x10000000 != 0 {
             unsafe {
                 ShowWindow(self.window, 0);
             }
@@ -280,7 +292,7 @@ impl State {
         self.explorer_process = pid;
     }
 
-    fn position(&mut self, raise: bool) {
+    fn position(&mut self) {
         if self.opening_menu {
             return;
         }
@@ -310,7 +322,7 @@ impl State {
                     .place
                     .filter(|_| since.elapsed() < Duration::from_millis(900))
                 {
-                    self.place_window(rect, raise);
+                    self.place_window(rect);
                 } else {
                     self.hide_strip(true);
                 }
@@ -345,37 +357,94 @@ impl State {
                 return;
             }
             self.show_tray(false);
+            self.attach_taskbar(taskbar);
             let top = bar.top + (bar.height() - height) / 2;
-            self.place_window(
-                Rect {
-                    left: right - width,
-                    top,
-                    right,
-                    bottom: top + height,
-                },
-                raise,
-            );
+            self.place_window(Rect {
+                left: right - width,
+                top,
+                right,
+                bottom: top + height,
+            });
         }
     }
 
-    unsafe fn place_window(&mut self, rect: Rect, raise: bool) {
-        let same = self.place == Some(rect);
-        if same && !raise && IsWindowVisible(self.window) != 0 && !covered(self.window, rect) {
+    unsafe fn detach_taskbar(&mut self) {
+        if self.taskbar_parent == 0 {
+            return;
+        }
+        SetParent(self.window, 0);
+        SetWindowLongW(self.window, -16, 0x80000000u32 as i32);
+        self.taskbar_parent = 0;
+        self.attempted_parent = 0;
+        self.place = None;
+    }
+
+    unsafe fn attach_taskbar(&mut self, taskbar: Handle) {
+        if self.attempted_parent == taskbar {
+            return;
+        }
+        self.attempted_parent = taskbar;
+
+        // A taskbar child follows Explorer's own visibility and Z-order.
+        // Some Windows configurations reject cross-process parenting.
+        if self.taskbar_parent != 0 {
+            SetParent(self.window, 0);
+        }
+        self.taskbar_parent = 0;
+        self.place = None;
+
+        const STYLE: i32 = -16;
+        const CHILD: i32 = 0x44000000; // WS_CHILD | WS_CLIPSIBLINGS
+        const POPUP: i32 = 0x80000000u32 as i32;
+        let visibility = GetWindowLongW(self.window, STYLE) & 0x10000000;
+        SetWindowLongW(self.window, STYLE, CHILD | visibility);
+        SetParent(self.window, taskbar);
+        if GetAncestor(self.window, 1) == taskbar {
+            self.taskbar_parent = taskbar;
+            if SetLayeredWindowAttributes(self.window, self.key(), 255, 1) == 0 {
+                self.detach_taskbar();
+                self.attempted_parent = taskbar;
+                SetLayeredWindowAttributes(self.window, self.key(), 255, 1);
+            }
+        } else {
+            SetWindowLongW(self.window, STYLE, POPUP | visibility);
+        }
+    }
+
+    unsafe fn place_window(&mut self, rect: Rect) {
+        let child = self.taskbar_parent != 0;
+        let mut current = Rect::default();
+        let same_size = self
+            .place
+            .is_some_and(|old| old.width() == rect.width() && old.height() == rect.height());
+        let same = self.place.is_some()
+            && GetWindowRect(self.window, &mut current) != 0
+            && current == rect;
+        let visible = GetWindowLongW(self.window, -16) & 0x10000000 != 0;
+        if same && visible && !covered(self.window, rect, child) {
+            return;
+        }
+
+        let mut point = Point {
+            x: rect.left,
+            y: rect.top,
+        };
+        if child && ScreenToClient(self.taskbar_parent, &mut point) == 0 {
             return;
         }
         let flags = 0x0250 | if same { 3 } else { 0 };
         if SetWindowPos(
             self.window,
-            -1,
-            rect.left,
-            rect.top,
+            if child { 0 } else { -1 },
+            point.x,
+            point.y,
             rect.width(),
             rect.height(),
             flags,
         ) != 0
         {
             self.place = Some(rect);
-            if !same {
+            if !same_size {
                 self.layout_tooltips(rect.height());
                 InvalidateRect(self.window, null(), 0);
             }
@@ -664,14 +733,14 @@ unsafe fn line(dc: Handle, x: i32, y: i32, right: i32, bottom: i32) {
     LineTo(dc, right, bottom);
 }
 
-unsafe fn covered(strip: Handle, rect: Rect) -> bool {
+unsafe fn covered(strip: Handle, rect: Rect, siblings: bool) -> bool {
     let mut window = GetWindow(strip, 3);
     for _ in 0..128 {
         if window == 0 {
             break;
         }
         let mut bounds = Rect::default();
-        if GetWindowLongW(window, -20) & 8 != 0
+        if (siblings || GetWindowLongW(window, -20) & 8 != 0)
             && IsWindowVisible(window) != 0
             && GetWindowRect(window, &mut bounds) != 0
             && rect.overlaps(bounds)
@@ -775,7 +844,7 @@ fn restart_elevated(window: Handle) {
         };
         if result > 32 {
             unsafe {
-                DestroyWindow(window);
+                close_strip(window);
             }
         }
     }
@@ -885,7 +954,7 @@ unsafe fn popup(window: Handle) {
             state(|s| {
                 s.hidden = !s.hidden;
                 s.suspend();
-                s.position(true);
+                s.position();
             });
         }
         2 => {
@@ -907,7 +976,7 @@ unsafe fn popup(window: Handle) {
         }
         3 => enable_pawnio(window),
         4 => {
-            DestroyWindow(window);
+            close_strip(window);
         }
         _ => {}
     }
@@ -924,7 +993,7 @@ unsafe extern "system" fn shell_event(
 ) {
     if object == 0 && child == 0 {
         state(|s| {
-            if !s.hidden && !s.locked && !s.screen_off && !s.opening_menu {
+            if s.taskbar_parent == 0 && !s.hidden && !s.locked && !s.screen_off && !s.opening_menu {
                 KillTimer(s.window, 2);
                 SetTimer(s.window, 2, 35, 0);
             }
@@ -932,13 +1001,25 @@ unsafe extern "system" fn shell_event(
     }
 }
 
+unsafe fn close_strip(window: Handle) {
+    state(|s| {
+        s.taskbar_parent = 0;
+    });
+    DestroyWindow(window);
+}
+
 unsafe extern "system" fn window_proc(window: Handle, message: u32, w: usize, l: isize) -> isize {
     match message {
         0x0002 => {
             UI.with(|ui| {
-                ui.borrow_mut().take();
+                let mut ui = ui.borrow_mut();
+                RECREATE_STRIP.set(ui.as_ref().is_some_and(|s| s.taskbar_parent != 0));
+                ui.take();
             });
             PostQuitMessage(0);
+        }
+        0x0010 => {
+            close_strip(window);
         }
         0x000f => {
             let mut paint: Paint = zeroed();
@@ -957,7 +1038,7 @@ unsafe extern "system" fn window_proc(window: Handle, message: u32, w: usize, l:
             if w == 2 {
                 KillTimer(window, 2);
             }
-            state(|s| s.position(w == 2));
+            state(|s| s.position());
         }
         0x0202 | 0x0205 => popup(window),
         0x0218 if w == 0x8013 && l != 0 => {
@@ -965,7 +1046,7 @@ unsafe extern "system" fn window_proc(window: Handle, message: u32, w: usize, l:
             state(|s| {
                 s.screen_off = value == 0;
                 s.suspend();
-                s.position(true);
+                s.position();
             });
             return 1;
         }
@@ -973,7 +1054,7 @@ unsafe extern "system" fn window_proc(window: Handle, message: u32, w: usize, l:
             state(|s| {
                 s.locked = w == 7;
                 s.suspend();
-                s.position(true);
+                s.position();
             });
         }
         0x001a | 0x031a => {
@@ -984,14 +1065,14 @@ unsafe extern "system" fn window_proc(window: Handle, message: u32, w: usize, l:
                     s.refresh_fonts();
                     InvalidateRect(window, null(), 0);
                 }
-                s.position(true);
+                s.position();
             });
         }
         sensors::SAMPLE_READY => {
             state(State::reads_ready);
         }
         REPOSITION => {
-            state(|s| s.position(true));
+            state(|s| s.position());
         }
         TRAY => {
             if l as u32 == 0x0202 || l as u32 == 0x0205 {
@@ -1019,7 +1100,7 @@ unsafe extern "system" fn window_proc(window: Handle, message: u32, w: usize, l:
             if state(|s| message == s.shell_message) == Some(true) {
                 state(|s| {
                     s.tray = false;
-                    s.position(true);
+                    s.position();
                 });
             } else {
                 return DefWindowProcW(window, message, w, l);
@@ -1062,31 +1143,36 @@ pub fn run() {
             small_icon: 0,
         };
         if RegisterClassExW(&info) != 0 {
-            let window = CreateWindowExW(
-                0x08080088,
-                class.as_ptr(),
-                wide(HELP).as_ptr(),
-                0x80000000,
-                -32000,
-                -32000,
-                1,
-                1,
-                0,
-                0,
-                instance,
-                0,
-            );
-            if window != 0 {
-                if let Some(init) = State::new(window) {
-                    UI.with(|ui| *ui.borrow_mut() = Some(init));
-                    PostMessageW(window, REPOSITION, 0, 0);
-                    let mut message = Message::default();
-                    while GetMessageW(&mut message, 0, 0, 0) > 0 {
-                        TranslateMessage(&message);
-                        DispatchMessageW(&message);
+            loop {
+                let window = CreateWindowExW(
+                    0x08080088,
+                    class.as_ptr(),
+                    wide(HELP).as_ptr(),
+                    0x80000000,
+                    -32000,
+                    -32000,
+                    1,
+                    1,
+                    0,
+                    0,
+                    instance,
+                    0,
+                );
+                if window != 0 {
+                    if let Some(init) = State::new(window) {
+                        UI.with(|ui| *ui.borrow_mut() = Some(init));
+                        PostMessageW(window, REPOSITION, 0, 0);
+                        let mut message = Message::default();
+                        while GetMessageW(&mut message, 0, 0, 0) > 0 {
+                            TranslateMessage(&message);
+                            DispatchMessageW(&message);
+                        }
+                    } else {
+                        close_strip(window);
                     }
-                } else {
-                    DestroyWindow(window);
+                }
+                if !RECREATE_STRIP.replace(false) {
+                    break;
                 }
             }
         }

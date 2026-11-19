@@ -203,6 +203,10 @@ extern "system" {
     pub fn GetClientRect(window: Handle, rect: *mut Rect) -> Bool;
     pub fn GetWindow(window: Handle, command: u32) -> Handle;
     pub fn GetWindowLongW(window: Handle, index: i32) -> i32;
+    pub fn SetWindowLongW(window: Handle, index: i32, value: i32) -> i32;
+    pub fn SetParent(window: Handle, parent: Handle) -> Handle;
+    pub fn GetAncestor(window: Handle, flags: u32) -> Handle;
+    pub fn ScreenToClient(window: Handle, point: *mut Point) -> Bool;
     pub fn GetWindowThreadProcessId(window: Handle, process: *mut u32) -> u32;
     pub fn IsWindowVisible(window: Handle) -> Bool;
     pub fn ShowWindow(window: Handle, command: i32) -> Bool;
