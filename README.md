@@ -42,3 +42,6 @@ The script creates `MoLap.exe` in the repository root. The first release was bui
 
 <img width="1917" height="500" alt="image" src="https://github.com/user-attachments/assets/d63a5bf7-b950-4448-a4b9-66fb35765209" />
 
+## License
+
+The original MoLap code is available under the [MIT License](LICENSE). Third-party components retain their respective licenses. The [PawnIO module notices](third-party/PawnIO/NOTICE.md) link to the corresponding source versions and the [LGPL license text](third-party/PawnIO/COPYING).
