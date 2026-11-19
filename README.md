@@ -39,3 +39,6 @@ Install [Rust and Cargo](https://www.rust-lang.org/tools/install) with a Windows
 ```
 
 The script creates `MoLap.exe` in the repository root. The first release was built with the `x86_64-pc-windows-gnu` target.
+
+<img width="1917" height="500" alt="image" src="https://github.com/user-attachments/assets/d63a5bf7-b950-4448-a4b9-66fb35765209" />
+
