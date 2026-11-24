@@ -23,8 +23,13 @@ const DISPLAY_POWER: Guid = Guid {
     a: 0x6fe69556,
     b: 0x704a,
     c: 0x47a0,
-    d: [0x8f, 0x24, 0xc9, 0x3d, 0x93, 0x6f, 0xda, 0x47],
+    d: [0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47],
 };
+#[repr(C)]
+struct PowerBroadcast {
+    setting: Guid,
+    length: u32,
+}
 const HELP: &str = "MoLap";
 static TASKBAR: &[u16] = &[
     83, 104, 101, 108, 108, 95, 84, 114, 97, 121, 87, 110, 100, 0,
@@ -65,8 +70,12 @@ struct State {
     tip: Handle,
     tip_count: usize,
     tip_text: Vec<u16>,
+    tips_dirty: bool,
     value_font: Handle,
     symbol_font: Handle,
+    bg_brush: Handle,
+    ink_brush: Handle,
+    ink_pen: Handle,
 }
 
 fn state<T>(f: impl FnOnce(&mut State) -> T) -> Option<T> {
@@ -127,8 +136,12 @@ impl State {
             tip: 0,
             tip_count: 0,
             tip_text: Vec::new(),
+            tips_dirty: false,
             value_font: 0,
             symbol_font: 0,
+            bg_brush: 0,
+            ink_brush: 0,
+            ink_pen: 0,
         };
         unsafe {
             state.shell_message = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
@@ -166,7 +179,7 @@ impl State {
                 SendMessageW(state.tip, 0x0418, 0, 420);
             }
         }
-        state.refresh_fonts();
+        state.refresh_resources();
         Some(state)
     }
 
@@ -202,17 +215,28 @@ impl State {
         }
     }
 
-    fn refresh_fonts(&mut self) {
+    fn refresh_resources(&mut self) {
         unsafe {
-            if self.value_font != 0 {
-                DeleteObject(self.value_font);
+            for handle in [
+                &mut self.value_font,
+                &mut self.symbol_font,
+                &mut self.bg_brush,
+                &mut self.ink_brush,
+                &mut self.ink_pen,
+            ] {
+                if *handle != 0 {
+                    DeleteObject(*handle);
+                    *handle = 0;
+                }
             }
-            if self.symbol_font != 0 {
-                DeleteObject(self.symbol_font);
-            }
+            let key = self.key();
+            let ink = if self.light { 0 } else { 0xffffff };
             self.value_font = font("Segoe UI", self.scale(12));
             self.symbol_font = font("Segoe Fluent Icons", self.scale(15));
-            SetLayeredWindowAttributes(self.window, self.key(), 255, 1);
+            self.bg_brush = CreateSolidBrush(key);
+            self.ink_brush = CreateSolidBrush(ink);
+            self.ink_pen = CreatePen(0, self.scale(1).max(1), ink);
+            SetLayeredWindowAttributes(self.window, key, 255, 1);
         }
     }
 
@@ -229,6 +253,7 @@ impl State {
                 });
             self.metrics = next;
             if relayout {
+                self.tips_dirty = true;
                 self.position();
             }
             if repaint {
@@ -335,7 +360,7 @@ impl State {
             };
             if self.dpi != dpi {
                 self.dpi = dpi;
-                self.refresh_fonts();
+                self.refresh_resources();
             }
             let mut monitor = MonitorInfo {
                 size: size_of::<MonitorInfo>() as u32,
@@ -374,6 +399,7 @@ impl State {
         }
         SetParent(self.window, 0);
         SetWindowLongW(self.window, -16, 0x80000000u32 as i32);
+        SetWindowPos(self.window, 0, 0, 0, 0, 0, 0x0037);
         self.taskbar_parent = 0;
         self.attempted_parent = 0;
         self.place = None;
@@ -398,6 +424,7 @@ impl State {
         const POPUP: i32 = 0x80000000u32 as i32;
         let visibility = GetWindowLongW(self.window, STYLE) & 0x10000000;
         SetWindowLongW(self.window, STYLE, CHILD | visibility);
+        SetWindowPos(self.window, 0, 0, 0, 0, 0, 0x0037);
         SetParent(self.window, taskbar);
         if GetAncestor(self.window, 1) == taskbar {
             self.taskbar_parent = taskbar;
@@ -408,6 +435,7 @@ impl State {
             }
         } else {
             SetWindowLongW(self.window, STYLE, POPUP | visibility);
+            SetWindowPos(self.window, 0, 0, 0, 0, 0, 0x0037);
         }
     }
 
@@ -422,6 +450,9 @@ impl State {
             && current == rect;
         let visible = GetWindowLongW(self.window, -16) & 0x10000000 != 0;
         if same && visible && !covered(self.window, rect, child) {
+            if self.tips_dirty {
+                self.layout_tooltips(rect.height());
+            }
             return;
         }
 
@@ -444,14 +475,17 @@ impl State {
         ) != 0
         {
             self.place = Some(rect);
-            if !same_size {
+            if !same_size || self.tips_dirty {
                 self.layout_tooltips(rect.height());
+            }
+            if !same_size {
                 InvalidateRect(self.window, null(), 0);
             }
         }
     }
 
     unsafe fn layout_tooltips(&mut self, height: i32) {
+        self.tips_dirty = false;
         if self.tip == 0 {
             return;
         }
@@ -516,20 +550,16 @@ impl State {
     }
 
     unsafe fn render(&self, dc: Handle, mut area: Rect) {
-        let background = CreateSolidBrush(self.key());
-        FillRect(dc, &area, background);
-        DeleteObject(background);
+        FillRect(dc, &area, self.bg_brush);
         let ink = if self.light { 0 } else { 0xffffff };
-        let brush = CreateSolidBrush(ink);
-        let pen = CreatePen(0, self.scale(1).max(1), ink);
         let original_font = SelectObject(dc, self.value_font);
-        let original_pen = SelectObject(dc, pen);
+        let original_pen = SelectObject(dc, self.ink_pen);
         let original_brush = SelectObject(dc, GetStockObject(5)); // NULL_BRUSH
         SetBkMode(dc, 1);
         let y = (area.height() - self.scale(15)) / 2;
         for m in &self.metrics {
             let size = self.cell(m);
-            self.draw_icon(dc, m, area.left + self.scale(2), y, brush, ink);
+            self.draw_icon(dc, m, area.left + self.scale(2), y, self.ink_brush, ink);
             let mut text = Rect {
                 left: area.left + self.scale(21),
                 top: 0,
@@ -575,8 +605,6 @@ impl State {
         SelectObject(dc, original_font);
         SelectObject(dc, original_pen);
         SelectObject(dc, original_brush);
-        DeleteObject(pen);
-        DeleteObject(brush);
     }
 
     unsafe fn draw_icon(
@@ -594,7 +622,7 @@ impl State {
                 Rectangle(dc, x(1), y(3), x(16), y(13));
                 let right = m
                     .capacity
-                    .map(|v| x(3) + (self.scale(11) as f64 * v).round() as i32);
+                    .map(|v| x(3) + (self.scale(11) as f64 * v.clamp(0.0, 1.0)).round() as i32);
                 if let Some(right) = right {
                     FillRect(
                         dc,
@@ -675,6 +703,7 @@ impl Drop for State {
         }
         unsafe {
             KillTimer(self.window, 1);
+            KillTimer(self.window, 2);
             if let Some(unregister) = self
                 .session
                 .as_ref()
@@ -693,11 +722,16 @@ impl Drop for State {
             if self.explorer_hook != 0 {
                 UnhookWinEvent(self.explorer_hook);
             }
-            if self.value_font != 0 {
-                DeleteObject(self.value_font);
-            }
-            if self.symbol_font != 0 {
-                DeleteObject(self.symbol_font);
+            for handle in [
+                self.value_font,
+                self.symbol_font,
+                self.bg_brush,
+                self.ink_brush,
+                self.ink_pen,
+            ] {
+                if handle != 0 {
+                    DeleteObject(handle);
+                }
             }
         }
         self.show_tray(false);
@@ -724,8 +758,23 @@ unsafe fn font(face: &str, size: i32) -> Handle {
 }
 
 unsafe fn draw_text(dc: Handle, value: &str, mut rect: Rect, flags: u32) {
-    let text = wide(value);
-    DrawTextW(dc, text.as_ptr(), text.len() as i32 - 1, &mut rect, flags);
+    let mut stack = [0u16; 32];
+    let mut len = 0;
+    let mut overflow = false;
+    for ch in value.encode_utf16() {
+        if len == stack.len() {
+            overflow = true;
+            break;
+        }
+        stack[len] = ch;
+        len += 1;
+    }
+    if !overflow {
+        DrawTextW(dc, stack.as_ptr(), len as i32, &mut rect, flags);
+    } else {
+        let text = wide(value);
+        DrawTextW(dc, text.as_ptr(), text.len() as i32 - 1, &mut rect, flags);
+    }
 }
 
 unsafe fn line(dc: Handle, x: i32, y: i32, right: i32, bottom: i32) {
@@ -822,8 +871,8 @@ unsafe fn tool_text(s: &mut State, notification: isize) {
     data.text = s.tip_text.as_mut_ptr();
 }
 
-fn information(window: Handle, text: &str, title: &str, flags: u32) -> i32 {
-    unsafe { MessageBoxW(window, wide(text).as_ptr(), wide(title).as_ptr(), flags) }
+fn information(text: &str, title: &str, flags: u32) -> i32 {
+    unsafe { MessageBoxW(0, wide(text).as_ptr(), wide(title).as_ptr(), flags | 0x00010000) }
 }
 
 fn restart_elevated(window: Handle) {
@@ -856,7 +905,6 @@ fn enable_pawnio(window: Handle) {
         return;
     }
     if information(
-        window,
         "Install the official PawnIO driver for CPU and Intel UHD temperature?",
         "MoLap - Install PawnIO",
         0x0124,
@@ -903,15 +951,20 @@ fn enable_pawnio(window: Handle) {
         });
     if spawned.is_err() {
         state(|s| s.installing = false);
-        information(window, "Could not start the installer.", HELP, 0x30);
+        information("Could not start the installer.", HELP, 0x30);
     }
 }
 
 unsafe fn popup(window: Handle) {
     let Some((hidden, installing)) = state(|s| {
-        s.opening_menu = true;
-        (s.hidden, s.installing)
-    }) else {
+        if s.opening_menu {
+            None
+        } else {
+            s.opening_menu = true;
+            Some((s.hidden, s.installing))
+        }
+    })
+    .flatten() else {
         return;
     };
     let menu = CreatePopupMenu();
@@ -965,26 +1018,29 @@ unsafe fn popup(window: Handle) {
         }
         2 => {
             if let Some(readings) = state(|s| {
-                s.metrics
-                    .iter()
-                    .map(|m| {
-                        let temp = m
-                            .temperature
-                            .map(|v| format!("  {v}\u{b0}C"))
-                            .unwrap_or_default();
-                        format!("{}  {}{}  {}", m.label, m.value, temp, m.detail)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                if s.metrics.is_empty() {
+                    "No readings available yet.".into()
+                } else {
+                    s.metrics
+                        .iter()
+                        .map(|m| {
+                            let temp = m
+                                .temperature
+                                .map(|v| format!("  {v}\u{b0}C"))
+                                .unwrap_or_default();
+                            format!("{}  {}{}  {}", m.label, m.value, temp, m.detail)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
             }) {
-                information(window, &readings, HELP, 0x40);
+                information(&readings, HELP, 0x40);
             }
         }
         3 => enable_pawnio(window),
         5 => {
             if let Err(error) = crate::startup::set_enabled(!start_with_windows) {
                 information(
-                    window,
                     &format!("Could not update Windows startup: {error}"),
                     HELP,
                     0x30,
@@ -1037,6 +1093,9 @@ unsafe extern "system" fn window_proc(window: Handle, message: u32, w: usize, l:
         0x0010 => {
             close_strip(window);
         }
+        0x0016 if w != 0 => {
+            close_strip(window);
+        }
         0x000f => {
             let mut paint: Paint = zeroed();
             let dc = BeginPaint(window, &mut paint);
@@ -1050,6 +1109,9 @@ unsafe extern "system" fn window_proc(window: Handle, message: u32, w: usize, l:
         0x004e => {
             state(|s| tool_text(s, l));
         }
+        0x007e => {
+            state(|s| s.position());
+        }
         0x0113 => {
             if w == 2 {
                 KillTimer(window, 2);
@@ -1058,12 +1120,22 @@ unsafe extern "system" fn window_proc(window: Handle, message: u32, w: usize, l:
         }
         0x0202 | 0x0205 => popup(window),
         0x0218 if w == 0x8013 && l != 0 => {
-            let value = (l as *const u8).add(20).cast::<u32>().read_unaligned();
-            state(|s| {
-                s.screen_off = value == 0;
-                s.suspend();
-                s.position();
-            });
+            let header = &*(l as *const PowerBroadcast);
+            if header.setting == DISPLAY_POWER && header.length >= 4 {
+                let value = (l as *const u8)
+                    .add(size_of::<PowerBroadcast>())
+                    .cast::<u32>()
+                    .read_unaligned();
+                state(|s| {
+                    s.screen_off = value == 0;
+                    s.suspend();
+                    s.position();
+                });
+            }
+            return 1;
+        }
+        0x0218 if w == 0x0012 => {
+            state(|s| s.position());
             return 1;
         }
         0x02b1 if w == 7 || w == 8 => {
@@ -1078,7 +1150,7 @@ unsafe extern "system" fn window_proc(window: Handle, message: u32, w: usize, l:
                 let light = light_theme();
                 if s.light != light {
                     s.light = light;
-                    s.refresh_fonts();
+                    s.refresh_resources();
                     InvalidateRect(window, null(), 0);
                 }
                 s.position();
@@ -1101,7 +1173,6 @@ unsafe extern "system" fn window_proc(window: Handle, message: u32, w: usize, l:
                 restart_elevated(window);
             } else {
                 information(
-                    window,
                     if w != 0 {
                         "Could not start WinGet. Official installer: https://pawnio.eu/"
                     } else {
@@ -1116,6 +1187,7 @@ unsafe extern "system" fn window_proc(window: Handle, message: u32, w: usize, l:
             if state(|s| message == s.shell_message) == Some(true) {
                 state(|s| {
                     s.tray = false;
+                    s.attempted_parent = 0;
                     s.position();
                 });
             } else {

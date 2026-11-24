@@ -85,7 +85,7 @@ pub struct MonitorInfo {
 }
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 pub struct Guid {
     pub a: u32,
     pub b: u16,
@@ -374,8 +374,8 @@ pub fn reg_u32(key: Handle, path: &str, name: &str) -> Option<u32> {
 }
 
 pub fn reg_string(key: Handle, path: &str, name: &str) -> Option<String> {
-    let mut data = [0u16; 256];
-    let mut bytes = 512;
+    let mut data = [0u16; 512];
+    let mut bytes = (data.len() * 2) as u32;
     if unsafe {
         RegGetValueW(
             key,
@@ -390,9 +390,9 @@ pub fn reg_string(key: Handle, path: &str, name: &str) -> Option<String> {
     {
         return None;
     }
-    Some(String::from_utf16_lossy(
-        &data[..(bytes as usize / 2).saturating_sub(1)],
-    ))
+    let count = (bytes as usize / 2).min(data.len());
+    let end = data[..count].iter().position(|&c| c == 0).unwrap_or(count);
+    Some(String::from_utf16_lossy(&data[..end]))
 }
 
 pub struct OwnedHandle(pub Handle);
@@ -423,6 +423,13 @@ extern "system" {
 pub struct Library(Handle);
 
 impl Library {
+    pub fn load(path: &std::path::Path) -> Option<Self> {
+        use std::os::windows::ffi::OsStrExt;
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let module = unsafe { LoadLibraryExW(wide.as_ptr(), 0, 0x900) };
+        (module != 0).then_some(Self(module))
+    }
     pub fn system(name: &str) -> Option<Self> {
         let module = unsafe { LoadLibraryExW(wide(name).as_ptr(), 0, 0x800) };
         (module != 0).then_some(Self(module))

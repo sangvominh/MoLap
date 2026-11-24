@@ -43,14 +43,34 @@ pub fn worker(
     let (lock, wake) = &*control;
     loop {
         let mut state = lock.lock().unwrap();
+        let mut resumed = false;
         while state.paused && !state.quit {
+            resumed = true;
             state = wake.wait(state).unwrap();
-            monitor.previous = None;
         }
         if state.quit {
             break;
         }
         drop(state);
+        if resumed {
+            monitor.reset_baseline();
+            let state = lock.lock().unwrap();
+            if state.quit {
+                break;
+            }
+            if state.paused {
+                continue;
+            }
+            let (state, _) = wake
+                .wait_timeout(state, Duration::from_millis(250))
+                .unwrap();
+            if state.quit {
+                break;
+            }
+            if state.paused {
+                continue;
+            }
+        }
         if tx.try_send(monitor.sample()).is_ok() {
             unsafe {
                 PostMessageW(window, SAMPLE_READY, 0, 0);
@@ -103,11 +123,26 @@ impl Pdh {
         let library = Library::system("pdh.dll")?;
         unsafe {
             Some(Self {
-                open: std::mem::transmute(library.symbol(b"PdhOpenQueryW\0")?),
-                add: std::mem::transmute(library.symbol(b"PdhAddEnglishCounterW\0")?),
-                collect: std::mem::transmute(library.symbol(b"PdhCollectQueryData\0")?),
-                array: std::mem::transmute(library.symbol(b"PdhGetFormattedCounterArrayW\0")?),
-                close: std::mem::transmute(library.symbol(b"PdhCloseQuery\0")?),
+                open: std::mem::transmute::<
+                    *const c_void,
+                    unsafe extern "system" fn(*const u16, usize, *mut Handle) -> u32,
+                >(library.symbol(b"PdhOpenQueryW\0")?),
+                add: std::mem::transmute::<
+                    *const c_void,
+                    unsafe extern "system" fn(Handle, *const u16, usize, *mut Handle) -> u32,
+                >(library.symbol(b"PdhAddEnglishCounterW\0")?),
+                collect: std::mem::transmute::<
+                    *const c_void,
+                    unsafe extern "system" fn(Handle) -> u32,
+                >(library.symbol(b"PdhCollectQueryData\0")?),
+                array: std::mem::transmute::<
+                    *const c_void,
+                    unsafe extern "system" fn(Handle, u32, *mut u32, *mut u32, *mut c_void) -> u32,
+                >(library.symbol(b"PdhGetFormattedCounterArrayW\0")?),
+                close: std::mem::transmute::<
+                    *const c_void,
+                    unsafe extern "system" fn(Handle) -> u32,
+                >(library.symbol(b"PdhCloseQuery\0")?),
                 _library: library,
             })
         }
@@ -121,6 +156,7 @@ struct Counters {
     disk: Handle,
     thermal: Handle,
     buffer: Vec<u64>,
+    name: String,
 }
 
 impl Counters {
@@ -150,6 +186,7 @@ impl Counters {
             disk,
             thermal,
             buffer: Vec::new(),
+            name: String::new(),
         }
     }
 
@@ -165,7 +202,9 @@ impl Counters {
         if counter == 0 {
             return false;
         }
-        let Some(api) = &self.api else { return false };
+        let Some(array) = self.api.as_ref().map(|api| api.array) else {
+            return false;
+        };
         const MORE: u32 = 0x800007d2;
         for _ in 0..3 {
             let mut bytes = (self.buffer.len() * 8) as u32;
@@ -175,17 +214,19 @@ impl Counters {
             } else {
                 self.buffer.as_mut_ptr().cast()
             };
-            let status = unsafe { (api.array)(counter, 0x8200, &mut bytes, &mut count, buffer) };
+            let status = unsafe { array(counter, 0x8200, &mut bytes, &mut count, buffer) };
             if status == MORE && bytes > 0 && bytes <= 16 * 1024 * 1024 {
-                self.buffer.resize((bytes as usize + 7) / 8, 0);
+                self.buffer.resize((bytes as usize).div_ceil(8), 0);
                 continue;
             }
             if status != 0 || count as usize > self.buffer.len() * 8 / size_of::<CounterItem>() {
                 return false;
             }
             let mut valid = false;
+            let buffer = &self.buffer;
+            let name = &mut self.name;
             for index in 0..count as usize {
-                let raw = unsafe { &*self.buffer.as_ptr().cast::<CounterItem>().add(index) };
+                let raw = unsafe { &*buffer.as_ptr().cast::<CounterItem>().add(index) };
                 if raw.name.is_null() || raw.status > 1 || !raw.value.is_finite() || raw.value < 0.
                 {
                     continue;
@@ -195,8 +236,13 @@ impl Counters {
                     while end < 512 && *raw.name.add(end) != 0 {
                         end += 1;
                     }
-                    let name = String::from_utf16_lossy(std::slice::from_raw_parts(raw.name, end));
-                    item(&name, raw.value);
+                    name.clear();
+                    for ch in
+                        char::decode_utf16(std::slice::from_raw_parts(raw.name, end).iter().copied())
+                    {
+                        name.push(ch.unwrap_or(char::REPLACEMENT_CHARACTER));
+                    }
+                    item(name, raw.value);
                 }
                 valid = true;
             }
@@ -280,7 +326,7 @@ fn adapters() -> Vec<Adapter> {
             let describe: unsafe extern "system" fn(*mut c_void, *mut AdapterDesc) -> i32 =
                 std::mem::transmute(method(adapter, 10));
             let mut desc: AdapterDesc = zeroed();
-            if describe(adapter, &mut desc) >= 0 && desc.flags & 2 == 0 {
+            if describe(adapter, &mut desc) >= 0 && desc.flags & 2 == 0 && desc.vendor != 0x1414 {
                 let end = desc.name.iter().position(|&c| c == 0).unwrap_or(128);
                 result.push(Adapter {
                     name: String::from_utf16_lossy(&desc.name[..end]),
@@ -348,7 +394,7 @@ fn gpu_temperature(luid: u64) -> Option<i32> {
 
 type NvTemp = unsafe extern "C" fn(Handle, u32, *mut u32) -> i32;
 struct Nvml {
-    module: Handle,
+    _library: Library,
     gpu: Handle,
     temperature: NvTemp,
     shutdown: unsafe extern "C" fn() -> i32,
@@ -356,44 +402,35 @@ struct Nvml {
 
 impl Nvml {
     fn open() -> Option<Self> {
+        let library = Library::system("nvml.dll").or_else(|| {
+            let dir = std::env::var_os("ProgramFiles")?;
+            Library::load(&std::path::PathBuf::from(dir).join(r"NVIDIA Corporation\NVSMI\nvml.dll"))
+        })?;
         unsafe {
-            let module = LoadLibraryExW(wide("nvml.dll").as_ptr(), 0, 0x800);
-            if module == 0 {
+            let init: unsafe extern "C" fn() -> i32 =
+                std::mem::transmute(library.symbol(b"nvmlInit_v2\0")?);
+            let shutdown: unsafe extern "C" fn() -> i32 =
+                std::mem::transmute(library.symbol(b"nvmlShutdown\0")?);
+            let count: unsafe extern "C" fn(*mut u32) -> i32 =
+                std::mem::transmute(library.symbol(b"nvmlDeviceGetCount_v2\0")?);
+            let handle: unsafe extern "C" fn(u32, *mut Handle) -> i32 =
+                std::mem::transmute(library.symbol(b"nvmlDeviceGetHandleByIndex_v2\0")?);
+            let temperature: NvTemp =
+                std::mem::transmute(library.symbol(b"nvmlDeviceGetTemperature\0")?);
+            if init() != 0 {
                 return None;
             }
-            let result = (|| {
-                let get = |name: &[u8]| {
-                    let address = GetProcAddress(module, name.as_ptr());
-                    (!address.is_null()).then_some(address)
-                };
-                let init: unsafe extern "C" fn() -> i32 =
-                    std::mem::transmute(get(b"nvmlInit_v2\0")?);
-                let shutdown: unsafe extern "C" fn() -> i32 =
-                    std::mem::transmute(get(b"nvmlShutdown\0")?);
-                let count: unsafe extern "C" fn(*mut u32) -> i32 =
-                    std::mem::transmute(get(b"nvmlDeviceGetCount_v2\0")?);
-                let handle: unsafe extern "C" fn(u32, *mut Handle) -> i32 =
-                    std::mem::transmute(get(b"nvmlDeviceGetHandleByIndex_v2\0")?);
-                let temperature: NvTemp = std::mem::transmute(get(b"nvmlDeviceGetTemperature\0")?);
-                if init() != 0 {
-                    return None;
-                }
-                let (mut gpu, mut devices) = (0, 0);
-                if count(&mut devices) != 0 || devices != 1 || handle(0, &mut gpu) != 0 {
-                    shutdown();
-                    return None;
-                }
-                Some(Self {
-                    module,
-                    gpu,
-                    temperature,
-                    shutdown,
-                })
-            })();
-            if result.is_none() {
-                FreeLibrary(module);
+            let (mut gpu, mut devices) = (0, 0);
+            if count(&mut devices) != 0 || devices != 1 || handle(0, &mut gpu) != 0 {
+                shutdown();
+                return None;
             }
-            result
+            Some(Self {
+                _library: library,
+                gpu,
+                temperature,
+                shutdown,
+            })
         }
     }
 
@@ -408,7 +445,6 @@ impl Drop for Nvml {
     fn drop(&mut self) {
         unsafe {
             (self.shutdown)();
-            FreeLibrary(self.module);
         }
     }
 }
@@ -575,14 +611,18 @@ struct Disk {
     kind: &'static str,
     volumes: String,
     activity: Option<f64>,
-    handle: Option<OwnedHandle>,
     temperature: Option<i32>,
     capacity: (u64, u64),
+    missing_ticks: u8,
 }
 
 impl Disk {
+    fn open(number: u32) -> Option<OwnedHandle> {
+        open_device(&format!(r"\\.\PhysicalDrive{number}"), 0)
+    }
+
     fn new(number: u32) -> Self {
-        let handle = open_device(&format!(r"\\.\PhysicalDrive{number}"), 0);
+        let handle = Self::open(number);
         let mut reply = [0; 12];
         let kind = match handle.as_ref().and_then(|h| {
             ioctl(
@@ -606,14 +646,15 @@ impl Disk {
             kind,
             volumes: String::new(),
             activity: None,
-            handle,
             temperature: None,
             capacity: (0, 0),
+            missing_ticks: 0,
         }
     }
 
     fn temperature(&self) -> Option<i32> {
-        let h = self.handle.as_ref()?.0;
+        let handle = Self::open(self.number)?;
+        let h = handle.0;
         let mut reply = [0; 516];
         for property in [52, 51] {
             let request = [property, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -693,7 +734,7 @@ struct Monitor {
 
 fn gib(bytes: u64) -> String {
     let tenth = (bytes as f64 / 107_374_182.4).round() as u64;
-    if tenth % 10 == 0 {
+    if tenth.is_multiple_of(10) {
         (tenth / 10).to_string()
     } else {
         format!("{}.{}", tenth / 10, tenth % 10)
@@ -703,8 +744,9 @@ fn gib(bytes: u64) -> String {
 impl Monitor {
     fn new() -> Self {
         let mut devices = vec![0u16; 65536];
-        let n =
-            unsafe { QueryDosDeviceW(null(), devices.as_mut_ptr(), devices.len() as u32) } as usize;
+        let n = (unsafe { QueryDosDeviceW(null(), devices.as_mut_ptr(), devices.len() as u32) }
+            as usize)
+            .min(devices.len());
         let mut disks = BTreeMap::new();
         for name in devices[..n].split(|&c| c == 0) {
             if let Some(number) = String::from_utf16_lossy(name)
@@ -744,7 +786,7 @@ impl Monitor {
                 0x59C0,
             )
         });
-        Self {
+        let mut monitor = Self {
             counters: Counters::new(),
             disks,
             adapters: adapters(),
@@ -757,7 +799,18 @@ impl Monitor {
             graphics,
             nvidia: None,
             tried_nvidia: false,
-        }
+        };
+        monitor.cpu_usage();
+        monitor
+    }
+
+    fn reset_baseline(&mut self) {
+        self.previous = None;
+        self.cpu_usage();
+        self.counters.collect();
+        let now = Instant::now();
+        self.next_thermal = now;
+        self.next_disk = now;
     }
 
     fn cpu_usage(&mut self) -> Option<f64> {
@@ -791,17 +844,21 @@ impl Monitor {
         for disk in self.disks.values_mut() {
             disk.activity = None;
         }
+        let mut disk_ready = false;
         if collected {
             self.counters.read(self.counters.disk, |name, idle| {
                 let mut fields = name.splitn(2, char::is_whitespace);
                 let Some(number) = fields.next().and_then(|x| x.parse().ok()) else {
                     return;
                 };
-                let disk = self
-                    .disks
-                    .entry(number)
-                    .or_insert_with(|| Disk::new(number));
+                disk_ready = true;
+                let disk = self.disks.entry(number).or_insert_with(|| {
+                    let mut disk = Disk::new(number);
+                    disk.temperature = disk.temperature();
+                    disk
+                });
                 disk.activity = Some(100. - idle);
+                disk.missing_ticks = 0;
                 if let Some(volumes) = fields.next() {
                     if disk.volumes != volumes.trim() {
                         disk.volumes = volumes.trim().into();
@@ -809,6 +866,16 @@ impl Monitor {
                     }
                 }
             });
+            if disk_ready {
+                self.disks.retain(|_, disk| {
+                    if disk.activity.is_some() {
+                        true
+                    } else {
+                        disk.missing_ticks = disk.missing_ticks.saturating_add(1);
+                        disk.missing_ticks < 3
+                    }
+                });
+            }
         }
         let now = Instant::now();
         if now >= self.next_thermal {
@@ -818,7 +885,8 @@ impl Monitor {
                 self.counters.read(self.counters.thermal, |name, kelvin| {
                     if name.eq_ignore_ascii_case("CPU")
                         || name.eq_ignore_ascii_case("CPU Package")
-                        || name.to_ascii_uppercase().ends_with(".CPU")
+                        || (name.len() >= 4
+                            && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".CPU"))
                     {
                         let c = (kelvin - 273.15).round() as i32;
                         if (1..150).contains(&c) {
@@ -897,7 +965,11 @@ impl Monitor {
         {
             let (used, total) = disk.capacity;
             let capacity = (total != 0).then(|| used as f64 / total as f64);
-            let mut detail = format!("Disk {} ({}) - active time", disk.number, disk.volumes);
+            let mut detail = if disk.volumes.is_empty() {
+                format!("Disk {} - active time", disk.number)
+            } else {
+                format!("Disk {} ({}) - active time", disk.number, disk.volumes)
+            };
             if let Some(frac) = capacity {
                 detail.push_str(&format!(
                     "\n{}/{} GB used ({:.0}%)",
