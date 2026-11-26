@@ -1,8 +1,13 @@
 [package]
 name = "molap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-publish = false
+description = "Lightweight Windows Dynamic Island with Liquid Glass UI, hardware telemetry, and an Open Plugin SDK"
+license = "MIT"
+repository = "https://github.com/sangvominh/monitorLap"
+readme = "README.md"
+keywords = ["windows", "dynamic-island", "liquid-glass", "system-monitor", "plugin"]
+categories = ["gui", "os::windows-apis"]
 
 [profile.release]
 opt-level = "s"

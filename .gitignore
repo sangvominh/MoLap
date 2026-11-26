@@ -1,3 +1,7 @@
 MoLap.exe
+MoLap.new.exe
 /tham khảo/
 /target/
+*.pdb
+.DS_Store
+Thumbs.db

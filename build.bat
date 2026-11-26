@@ -5,7 +5,7 @@ if exist "%USERPROFILE%\.cargo\bin\cargo.exe" set "CARGO=%USERPROFILE%\.cargo\bi
 if defined MOLAP_CARGO set "CARGO=%MOLAP_CARGO%"
 pushd "%~dp0" || exit /b 1
 set "CARGO_TARGET_DIR=%CD%\target"
-"%CARGO%" build --release --locked --offline
+"%CARGO%" build --release --locked
 if errorlevel 1 (
     popd
     exit /b 1

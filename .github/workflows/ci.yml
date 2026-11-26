@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: Windows Rust & Plugin Checks
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Verify zero external Rust dependencies
+        shell: pwsh
+        run: |
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $pkg = $meta.packages | Where-Object { $_.name -eq 'molap' } | Select-Object -First 1
+          if (-not $pkg) { throw "molap package not found in cargo metadata" }
+          if ($pkg.dependencies.Count -ne 0) {
+            throw "Expected zero external Cargo dependencies, found: $($pkg.dependencies | ConvertTo-Json -Compress)"
+          }
+
+      - name: Validate bundled plugin PowerShell syntax
+        shell: pwsh
+        run: |
+          $scripts = Get-ChildItem -Path plugins -Filter *.ps1 -Recurse
+          foreach ($s in $scripts) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($s.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $msg = ($errors | ForEach-Object { "$($s.FullName):$($_.Extent.StartLineNumber): $($_.Message)" }) -join "`n"
+              throw "PowerShell syntax error(s):`n$msg"
+            }
+            Write-Host "Syntax OK: $($s.FullName)"
+          }
+
+      - name: Run unit tests
+        run: cargo test --locked
+
+      - name: Run Clippy lints
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build release binary
+        run: cargo build --release --locked

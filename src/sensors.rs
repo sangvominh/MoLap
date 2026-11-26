@@ -18,7 +18,7 @@ pub enum Kind {
     Disk,
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Metric {
     pub kind: Kind,
     pub label: String,
@@ -26,6 +26,7 @@ pub struct Metric {
     pub temperature: Option<i32>,
     pub detail: String,
     pub capacity: Option<f64>,
+    pub hog: Option<(String, u32)>,
 }
 
 fn percent(value: Option<f64>) -> String {
@@ -139,10 +140,9 @@ impl Pdh {
                     *const c_void,
                     unsafe extern "system" fn(Handle, u32, *mut u32, *mut u32, *mut c_void) -> u32,
                 >(library.symbol(b"PdhGetFormattedCounterArrayW\0")?),
-                close: std::mem::transmute::<
-                    *const c_void,
-                    unsafe extern "system" fn(Handle) -> u32,
-                >(library.symbol(b"PdhCloseQuery\0")?),
+                close: std::mem::transmute::<*const c_void, unsafe extern "system" fn(Handle) -> u32>(
+                    library.symbol(b"PdhCloseQuery\0")?,
+                ),
                 _library: library,
             })
         }
@@ -237,9 +237,9 @@ impl Counters {
                         end += 1;
                     }
                     name.clear();
-                    for ch in
-                        char::decode_utf16(std::slice::from_raw_parts(raw.name, end).iter().copied())
-                    {
+                    for ch in char::decode_utf16(
+                        std::slice::from_raw_parts(raw.name, end).iter().copied(),
+                    ) {
                         name.push(ch.unwrap_or(char::REPLACEMENT_CHARACTER));
                     }
                     item(name, raw.value);
@@ -722,6 +722,7 @@ struct Monitor {
     disks: BTreeMap<u32, Disk>,
     adapters: Vec<Adapter>,
     system_volume: String,
+    cpu_name: String,
     previous: Option<(u64, u64)>,
     next_thermal: Instant,
     next_disk: Instant,
@@ -730,6 +731,10 @@ struct Monitor {
     graphics: Option<Pawn>,
     nvidia: Option<Nvml>,
     tried_nvidia: bool,
+    proc_prev: BTreeMap<u32, (u64, String)>,
+    proc_sys_total: Option<u64>,
+    active_hog: Option<(String, u32)>,
+    hog_hold: u8,
 }
 
 fn gib(bytes: u64) -> String {
@@ -764,6 +769,10 @@ impl Monitor {
             "C:".into()
         };
         const CPU: &str = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0";
+        let cpu_name = reg_string(HKLM, CPU, "ProcessorNameString")
+            .map(|raw| raw.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Processor".into());
         let intel = reg_string(HKLM, CPU, "VendorIdentifier").as_deref() == Some("GenuineIntel");
         let ice = intel
             && reg_string(HKLM, CPU, "Identifier")
@@ -791,6 +800,7 @@ impl Monitor {
             disks,
             adapters: adapters(),
             system_volume,
+            cpu_name,
             previous: None,
             next_thermal: Instant::now(),
             next_disk: Instant::now(),
@@ -799,6 +809,10 @@ impl Monitor {
             graphics,
             nvidia: None,
             tried_nvidia: false,
+            proc_prev: BTreeMap::new(),
+            proc_sys_total: None,
+            active_hog: None,
+            hog_hold: 0,
         };
         monitor.cpu_usage();
         monitor
@@ -806,6 +820,10 @@ impl Monitor {
 
     fn reset_baseline(&mut self) {
         self.previous = None;
+        self.proc_prev.clear();
+        self.proc_sys_total = None;
+        self.active_hog = None;
+        self.hog_hold = 0;
         self.cpu_usage();
         self.counters.collect();
         let now = Instant::now();
@@ -813,26 +831,111 @@ impl Monitor {
         self.next_disk = now;
     }
 
-    fn cpu_usage(&mut self) -> Option<f64> {
+    fn cpu_usage(&mut self) -> (Option<f64>, u64) {
         let (mut idle, mut kernel, mut user) = (0, 0, 0);
         if unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } == 0 {
-            return None;
+            return (None, 0);
         }
         let total = kernel + user;
         let previous = self.previous.replace((idle, total));
-        let (i, t) = previous?;
-        (total > t && idle >= i).then(|| 100. * (1. - (idle - i) as f64 / (total - t) as f64))
+        let usage = previous.and_then(|(i, t)| {
+            (total > t && idle >= i).then(|| 100. * (1. - (idle - i) as f64 / (total - t) as f64))
+        });
+        (usage, total)
+    }
+
+    fn update_cpu_hog(&mut self, cpu_pct: Option<f64>, sys_total: u64) -> Option<(String, u32)> {
+        let load = cpu_pct.unwrap_or(0.0);
+        let temp = self.cpu_temp;
+        let warmup = load >= 55.0 || temp.is_some_and(|t| t >= 75);
+        let hot = load >= 75.0
+            || (load >= 50.0 && temp.is_some_and(|t| t >= 80))
+            || temp.is_some_and(|t| t >= 85);
+        let calm = load < 62.0 && temp.is_none_or(|t| t < 77);
+
+        if !warmup && self.hog_hold == 0 {
+            if !self.proc_prev.is_empty() || self.active_hog.is_some() {
+                self.proc_prev.clear();
+                self.proc_sys_total = None;
+                self.active_hog = None;
+            }
+            return None;
+        }
+
+        let snap = snapshot_process_times();
+        if let Some(prev_sys) = self.proc_sys_total {
+            if sys_total > prev_sys && !self.proc_prev.is_empty() {
+                let sys_delta = (sys_total - prev_sys) as f64;
+                let mut grouped: BTreeMap<String, u64> = BTreeMap::new();
+                for (&pid, &(cur_time, ref name)) in &snap {
+                    if let Some(&(prev_time, ref prev_name)) = self.proc_prev.get(&pid) {
+                        if prev_name == name && cur_time >= prev_time {
+                            *grouped.entry(name.clone()).or_default() += cur_time - prev_time;
+                        }
+                    }
+                }
+                let top =
+                    grouped
+                        .into_iter()
+                        .max_by_key(|(_, delta)| *delta)
+                        .map(|(name, delta)| {
+                            let pct = ((delta as f64 / sys_delta) * 100.0)
+                                .round()
+                                .clamp(0.0, 99.0) as u32;
+                            (name, pct)
+                        });
+                if let Some((best_name, pct)) = top {
+                    if hot && pct >= 10 {
+                        self.active_hog = Some((best_name, pct));
+                        self.hog_hold = 4;
+                    } else if self.hog_hold > 0 {
+                        if calm {
+                            self.hog_hold -= 1;
+                            if self.hog_hold == 0 {
+                                self.active_hog = None;
+                            } else if pct >= 8 {
+                                self.active_hog = Some((best_name, pct));
+                            }
+                        } else if pct >= 8 {
+                            self.active_hog = Some((best_name, pct));
+                        }
+                    }
+                } else if self.hog_hold > 0 && calm {
+                    self.hog_hold -= 1;
+                    if self.hog_hold == 0 {
+                        self.active_hog = None;
+                    }
+                }
+            }
+        }
+        self.proc_prev = snap;
+        self.proc_sys_total = (sys_total > 0).then_some(sys_total);
+        self.active_hog.clone()
     }
 
     fn sample(&mut self) -> Vec<Metric> {
-        let cpu = self.cpu_usage();
+        let (cpu, sys_total) = self.cpu_usage();
         let mut memory: Memory = unsafe { zeroed() };
         memory.size = size_of::<Memory>() as u32;
-        let ram = if unsafe { GlobalMemoryStatusEx((&mut memory as *mut Memory).cast()) } != 0 {
-            format!("{} GB", gib(memory.total.saturating_sub(memory.available)))
-        } else {
-            "--".into()
-        };
+        let (ram, ram_cap, ram_detail) =
+            if unsafe { GlobalMemoryStatusEx((&mut memory as *mut Memory).cast()) } != 0
+                && memory.total > 0
+            {
+                let used = memory.total.saturating_sub(memory.available);
+                let frac = (used as f64 / memory.total as f64).clamp(0.0, 1.0);
+                (
+                    format!("{} GB", gib(used)),
+                    Some(frac),
+                    format!(
+                        "Physical memory: {} / {} GB ({:.0}%)",
+                        gib(used),
+                        gib(memory.total),
+                        frac * 100.0
+                    ),
+                )
+            } else {
+                ("--".into(), None, "Physical memory".into())
+            };
         let collected = self.counters.collect();
         let mut engines = BTreeMap::<(u64, u32, u32), f64>::new();
         let gpu_ready = collected
@@ -921,22 +1024,25 @@ impl Monitor {
             }
         }
 
+        let cpu_hog = self.update_cpu_hog(cpu, sys_total);
         let mut result = Vec::with_capacity(2 + self.adapters.len() + self.disks.len());
         result.push(Metric {
             kind: Kind::Cpu,
             label: "CPU".into(),
             value: percent(cpu),
-            detail: "Processor usage".into(),
+            detail: self.cpu_name.clone(),
             temperature: self.cpu_temp,
             capacity: None,
+            hog: cpu_hog,
         });
         result.push(Metric {
             kind: Kind::Ram,
             label: "RAM".into(),
             value: ram,
-            detail: "Physical memory used".into(),
+            detail: ram_detail,
             temperature: None,
-            capacity: None,
+            capacity: ram_cap,
+            hog: None,
         });
         for (index, adapter) in self.adapters.iter().enumerate() {
             let busiest = engines
@@ -950,6 +1056,7 @@ impl Monitor {
                 temperature: adapter.thermal,
                 detail: adapter.name.clone(),
                 capacity: None,
+                hog: None,
             });
         }
         let is_system = |disk: &Disk| {
@@ -971,11 +1078,13 @@ impl Monitor {
                 format!("Disk {} ({}) - active time", disk.number, disk.volumes)
             };
             if let Some(frac) = capacity {
+                let free = total.saturating_sub(used);
                 detail.push_str(&format!(
-                    "\n{}/{} GB used ({:.0}%)",
+                    "\n{}/{} GB used ({:.0}%) · {} GB free",
                     gib(used),
                     gib(total),
-                    frac * 100.
+                    frac * 100.,
+                    gib(free)
                 ));
             }
             result.push(Metric {
@@ -985,10 +1094,93 @@ impl Monitor {
                 temperature: disk.temperature,
                 detail,
                 capacity,
+                hog: None,
             });
         }
         result
     }
+}
+
+fn clean_exe_name(raw: &str) -> String {
+    let base = raw
+        .trim()
+        .strip_suffix(".exe")
+        .or_else(|| raw.trim().strip_suffix(".EXE"))
+        .unwrap_or_else(|| raw.trim());
+    let pretty = match base.to_ascii_lowercase().as_str() {
+        "chrome" => "Chrome",
+        "msedge" => "Edge",
+        "code" => "VS Code",
+        "firefox" => "Firefox",
+        "explorer" => "Explorer",
+        "dwm" => "DWM",
+        "svchost" => "System",
+        "antigravity" => "Antigravity",
+        "rust-analyzer" => "rust-analyzer",
+        "rustc" => "rustc",
+        "cargo" => "Cargo",
+        _ => "",
+    };
+    let name = if !pretty.is_empty() {
+        pretty.to_string()
+    } else if base.chars().all(|c| !c.is_ascii_uppercase()) {
+        let mut chars = base.chars();
+        match chars.next() {
+            Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+            None => "Process".into(),
+        }
+    } else {
+        base.to_string()
+    };
+    name.chars().take(16).collect()
+}
+
+fn snapshot_process_times() -> BTreeMap<u32, (u64, String)> {
+    let mut map = BTreeMap::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(2, 0); // TH32CS_SNAPPROCESS
+        if snap == 0 || snap == -1 {
+            return map;
+        }
+        let mut entry = ProcessEntry32W {
+            size: size_of::<ProcessEntry32W>() as u32,
+            usage: 0,
+            process_id: 0,
+            default_heap_id: 0,
+            module_id: 0,
+            threads: 0,
+            parent_process_id: 0,
+            pri_class_base: 0,
+            flags: 0,
+            exe_file: [0; 260],
+        };
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let pid = entry.process_id;
+                if pid != 0 && pid != 4 {
+                    let h = OpenProcess(0x1000, 0, pid); // PROCESS_QUERY_LIMITED_INFORMATION
+                    if h != 0 {
+                        let (mut c, mut e, mut k, mut u) = (0u64, 0u64, 0u64, 0u64);
+                        if GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0 {
+                            let len = entry
+                                .exe_file
+                                .iter()
+                                .position(|&ch| ch == 0)
+                                .unwrap_or(entry.exe_file.len());
+                            let raw = String::from_utf16_lossy(&entry.exe_file[..len]);
+                            map.insert(pid, (k + u, clean_exe_name(&raw)));
+                        }
+                        CloseHandle(h);
+                    }
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    map
 }
 
 fn engine_id(name: &str) -> Option<(u64, u32, u32)> {
@@ -1013,6 +1205,15 @@ mod tests {
         assert_eq!(engine_id(first), Some((0x10332, 0, 2)));
         assert_eq!(engine_id(first), engine_id(second));
         assert_eq!(engine_id("_Total"), None);
+    }
+
+    #[test]
+    fn clean_exe_name_and_snapshot_work() {
+        assert_eq!(clean_exe_name("chrome.exe"), "Chrome");
+        assert_eq!(clean_exe_name("Code.exe"), "VS Code");
+        assert_eq!(clean_exe_name("mytool.exe"), "Mytool");
+        let snap = snapshot_process_times();
+        assert!(!snap.is_empty());
     }
 
     #[test]
