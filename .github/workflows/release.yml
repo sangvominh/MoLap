@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Windows Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $stage = "release_stage\MoLap-$tag"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          Copy-Item "target\release\molap.exe" "$stage\MoLap.exe"
+          Copy-Item "LICENSE" "$stage\"
+          Copy-Item "THIRD_PARTY_NOTICES.md" "$stage\"
+          Copy-Item "README.md" "$stage\"
+          Copy-Item -Recurse "plugins" "$stage\plugins"
+          New-Item -ItemType Directory -Force -Path "$stage\third-party" | Out-Null
+          Copy-Item -Recurse "third-party\PawnIO" "$stage\third-party\PawnIO"
+
+          $zipName = "MoLap-$tag-windows-x64.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $zipName -Force
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            MoLap-${{ github.ref_name }}-windows-x64.zip
